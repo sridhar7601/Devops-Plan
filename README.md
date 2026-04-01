@@ -275,10 +275,10 @@ ECS task definitions are visible in the console and API. Anyone with ECS access 
                              │                         │
                      Frontend Requests           API Requests
                              │                         │
-                    ┌────────▼────────┐       ┌────────▼────────┐
-                    │   CloudFront    │       │   Route 53      │
-                    │   (CDN)         │       │   (DNS)         │
-                    └────────┬────────┘       └────────┬────────┘
+                    ┌────────▼────────┐                |
+                    │   CloudFront    │                | 
+                    │   (CDN)         │                |
+                    └────────┬────────┘                |
                              │                         │
                     ┌────────▼────────┐       ┌────────▼────────┐
                     │   S3 Bucket     │       │      ALB        │
