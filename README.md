@@ -20,18 +20,6 @@ A multi-tenant Learning Management System with AI-powered content generation. Th
 
 ---
 
-### Cost of Not Containerizing
-
-| Risk | Impact | Likelihood |
-|------|--------|-----------|
-| Deploy breaks production, no clean rollback | Downtime for all tenants until manually fixed | Medium — happens with any manual deploy process |
-| AI Worker memory spike crashes API | All users lose access until server restarts | Medium — large PDFs with many images can spike to 4+ GB |
-| Server dies, rebuild takes 30+ min | Complete outage, potential data loss in Redis queue | Low but catastrophic |
-| Can't scale for batch uploads | 10 simultaneous uploads take 2.5+ hours with no way to speed up | High — as tenant count grows |
-| New developer setup takes hours | Slows team velocity, inconsistent environments | Guaranteed |
-
----
-
 ## AWS Services — Why Each One, What It Does
 
 ### 1. ECS Fargate (API) — Auto-Scalable
