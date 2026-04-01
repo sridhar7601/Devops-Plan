@@ -1,34 +1,50 @@
-# Balanced Architecture (Detailed)
+# LMS AI Platform — Production AWS Architecture
 
-## Your Current Stack (From Code Analysis)
+## Application Overview
 
-| Layer | What you have |
-|-------|--------------|
-| API | FastAPI + Uvicorn |
-| Task Queue | **Celery** with Redis broker (already implemented) |
-| Queues | `ai_processing`, `reports`, `default` (SLA, notifications, webhooks) |
-| Scheduler | **Celery Beat** — hourly SLA sweep |
-| AI | OpenAI GPT-4o/5.4, DALL-E 3, TTS-1 |
-| Storage | AWS S3 (PDFs, images, audio, reports) |
-| Database | PostgreSQL 17 (SQLAlchemy, pool_size=10, max_overflow=20) |
-| Auth | JWT in httponly cookies, RBAC (6 roles) |
-| Multi-tenant | tenant_id on every query, tenant-scoped S3 paths |
+A multi-tenant Learning Management System with AI-powered content generation. The platform enables organizations to upload educational PDFs and automatically generate structured lesson content — summaries, translations, questions, diagrams, and audio — using OpenAI GPT-4o, DALL-E 3, and TTS models.
+
+## Current Technology Stack
+
+| Layer | Technology |
+|-------|-----------|
+| API Server | FastAPI (Python 3.12) + Uvicorn |
+| Async Task Queue | Celery with Redis broker |
+| Task Queues | `ai_processing`, `reports`, `default` (SLA, notifications, webhooks) |
+| Periodic Scheduler | Celery Beat — hourly SLA compliance sweep |
+| AI Services | OpenAI GPT-4o (content), DALL-E 3 (images), TTS-1 (audio) |
+| File Storage | AWS S3 — PDFs, AI-generated images, audio, exported reports |
+| Database | PostgreSQL 17 — SQLAlchemy ORM with connection pooling |
+| Authentication | JWT tokens in httponly cookies, role-based access control (6 roles) |
+| Multi-tenancy | Tenant-scoped data isolation on all queries and S3 paths |
+
+---
+
+### Cost of Not Containerizing
+
+| Risk | Impact | Likelihood |
+|------|--------|-----------|
+| Deploy breaks production, no clean rollback | Downtime for all tenants until manually fixed | Medium — happens with any manual deploy process |
+| AI Worker memory spike crashes API | All users lose access until server restarts | Medium — large PDFs with many images can spike to 4+ GB |
+| Server dies, rebuild takes 30+ min | Complete outage, potential data loss in Redis queue | Low but catastrophic |
+| Can't scale for batch uploads | 10 simultaneous uploads take 2.5+ hours with no way to speed up | High — as tenant count grows |
+| New developer setup takes hours | Slows team velocity, inconsistent environments | Guaranteed |
 
 ---
 
 ## AWS Services — Why Each One, What It Does
 
-### 1. ECS Fargate (API) — 2 Fixed Tasks
+### 1. ECS Fargate (API) — Auto-Scalable
 
-**What it runs:** Your FastAPI app (`uvicorn src.main:app`)
+**What it runs:** FastAPI application server (`uvicorn src.main:app`)
 
 **Why Fargate, not EC2:**
-- No server patching, no SSH, no OS management
-- Pay per task (vCPU + memory), not per instance
+- No server patching, no SSH access, no OS management
+- Pay per task (vCPU + memory), not per idle instance
 - Health checks auto-restart crashed containers
+- Seamless horizontal scaling without capacity planning
 
-**Why 2 fixed tasks, not auto-scaling:**
-Your API is lightweight — the heavy work (LLM calls, report generation) is offloaded to Celery workers. The API endpoints are fast:
+**API endpoint response profile:**
 
 | Endpoint category | What it does | Avg response time |
 |------------------|-------------|-------------------|
@@ -40,17 +56,19 @@ Your API is lightweight — the heavy work (LLM calls, report generation) is off
 | Dashboard stats | Aggregate COUNT queries | 50–200ms |
 | Notifications | Simple CRUD | 10–50ms |
 
-The only slow API call is PDF upload, and even that returns immediately after queuing. The API itself doesn't need scaling — 2 tasks across 2 AZs gives you high availability.
+Most API calls complete in under 200ms. PDF upload is the slowest but returns immediately after queuing the AI processing task to Celery.
 
-**Spec:** 1 vCPU, 2 GB memory per task
+**Scaling:** Minimum 2 tasks (high availability across 2 AZs), scales out based on configurable metrics (request count, CPU utilization, or custom CloudWatch metrics). Scaling policy to be defined based on observed production load patterns.
+
+**Spec:** 1 vCPU, 2 GB memory per task | Min: 2, Max: configurable
 
 ---
 
-### 2. ECS Fargate (Celery Workers) — Your Real Compute
+### 2. ECS Fargate (Celery Workers) — Background Processing Engine
 
-This is where the actual work happens. You need **3 separate worker groups**, matching your existing queue routing in `celery_app.py`:
+This is where the heavy compute happens. Three separate worker groups, each mapped to a dedicated Celery queue for independent scaling and isolation:
 
-#### Worker Group A: `ai_processing` queue (1–2 tasks)
+#### Worker Group A: `ai_processing` queue — Auto-Scalable
 
 **What it runs:**
 ```bash
@@ -69,11 +87,13 @@ Per page, this task does:
 **Time per page:** 18–30 seconds
 **Time per 100-page lesson:** 30–50 minutes (pages run via `asyncio.gather`)
 
-**Why 1–2 tasks:** Each task runs 2 concurrent workers (`-c 2`). Each worker holds a DB session for the full lesson duration. More workers = more DB connections held open. Since the bottleneck is OpenAI API latency (not CPU), adding more workers doesn't help much — you're waiting on network, not computing.
+Each task runs 2 concurrent Celery workers (`-c 2`). Each worker holds a DB session for the full lesson duration (15–50 min). The bottleneck is OpenAI API latency, not CPU — but scaling out more tasks increases parallel lesson throughput when multiple uploads are queued.
 
-**Spec:** 1 vCPU, 3 GB memory (images + audio in memory)
+**Scaling:** Minimum 1 task, scales out based on queue depth (configurable). Each additional task doubles concurrent lesson processing capacity.
 
-#### Worker Group B: `reports` queue (1 task)
+**Spec:** 1 vCPU, 3 GB memory per task (images + audio buffered in memory) | Min: 1, Max: configurable
+
+#### Worker Group B: `reports` queue
 
 **What it runs:**
 ```bash
@@ -93,7 +113,7 @@ Per report, this task does:
 
 **Spec:** 0.5 vCPU, 2 GB memory (openpyxl can be memory-heavy for large lessons)
 
-#### Worker Group C: `default` queue (1 task)
+#### Worker Group C: `default` queue
 
 **What it runs:**
 ```bash
@@ -112,7 +132,7 @@ celery -A src.celery_app worker -Q default -c 4 --prefetch-multiplier=1
 
 ---
 
-### 3. Celery Beat (Scheduler) — 1 Tiny Task
+### 3. Celery Beat (Scheduler) — Singleton
 
 **What it runs:**
 ```bash
@@ -261,58 +281,151 @@ ECS task definitions are visible in the console and API. Anyone with ECS access 
 ## Architecture Diagram
 
 ```
-                         ┌──────────────┐
-                         │   Route 53   │
-                         └──────┬───────┘
-                                │
-                         ┌──────▼───────┐
-                         │  CloudFront  │
-                         │  + ACM SSL   │
-                         └──────┬───────┘
-                                │
-               ┌────────────────┼────────────────┐
-               │                                 │
-        ┌──────▼──────┐                   ┌──────▼──────┐
-        │ S3 Bucket   │                   │     ALB     │
-        │ (React SPA) │                   │  (HTTPS)    │
-        └─────────────┘                   └──────┬──────┘
-                                                 │
-                                    ┌────────────┼────────────┐
-                                    │                         │
-                              ┌─────▼─────┐             ┌────▼──────┐
-                              │ ECS API-1 │             │ ECS API-2 │
-                              │ (FastAPI) │             │ (FastAPI) │
-                              └─────┬─────┘             └─────┬─────┘
-                                    │                         │
-                                    └────────────┬────────────┘
-                                                 │
-                         ┌───────────────────────┼───────────────────────┐
-                         │                       │                       │
-                  ┌──────▼──────┐         ┌──────▼──────┐         ┌─────▼──────┐
-                  │ ElastiCache │         │    RDS      │         │  S3 Bucket │
-                  │  (Redis)    │         │ PostgreSQL  │         │  (Files)   │
-                  │  Broker +   │         │  Multi-AZ   │         │            │
-                  │  Results    │         │             │         │            │
-                  └──────┬──────┘         └──────▲──────┘         └─────▲──────┘
-                         │                       │                      │
-            ┌────────────┼────────────┐          │                      │
-            │            │            │          │                      │
-     ┌──────▼─────┐ ┌───▼────┐ ┌────▼────┐     │                      │
-     │  AI Worker │ │ Report │ │ Default │     │                      │
-     │  1-2 tasks │ │ Worker │ │ Worker  │     │                      │
-     │ queue:     │ │ queue: │ │ queue:  │     │                      │
-     │ ai_process │ │reports │ │default  │─────┘──────────────────────┘
-     │            │ │        │ │(SLA,    │
-     │ GPT+DALLE  │ │ Excel  │ │ notify, │
-     │ +TTS+S3    │ │ Word   │ │ webhook)│
-     └────────────┘ │ HTML   │ └─────────┘
-                    └────────┘
-                         │
-                  ┌──────▼──────┐
-                  │ Celery Beat │
-                  │ (Scheduler) │
-                  │ hourly SLA  │
-                  └─────────────┘
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │                            USERS / BROWSERS                             │
+    └────────────────────────┬─────────────────────────┬───────────────────────┘
+                             │                         │
+                     Frontend Requests           API Requests
+                             │                         │
+                    ┌────────▼────────┐       ┌────────▼────────┐
+                    │   CloudFront    │       │   Route 53      │
+                    │   (CDN)         │       │   (DNS)         │
+                    └────────┬────────┘       └────────┬────────┘
+                             │                         │
+                    ┌────────▼────────┐       ┌────────▼────────┐
+                    │   S3 Bucket     │       │      ALB        │
+                    │  (React SPA)    │       │  (HTTPS + SSL)  │
+                    │  Static Assets  │       │  Health Checks  │
+                    └─────────────────┘       └────────┬────────┘
+                                                       │
+                                          ┌────────────┼────────────┐
+                                          │            │            │
+                                    ┌─────▼─────┐ ┌───▼─────┐ ┌───▼─────┐
+                                    │  ECS API  │ │ ECS API │ │ ECS API │
+                                    │  Task 1   │ │ Task 2  │ │ Task N  │
+                                    │ (FastAPI) │ │(FastAPI)│ │(FastAPI)│
+                                    └─────┬─────┘ └────┬────┘ └────┬────┘
+                                          │            │            │
+                                          └────────────┼────────────┘
+                                                       │ Auto-Scalable
+                                                       │ (min: 2)
+                                          ┌────────────┴────────────┐
+                                          │                         │
+                                 ┌────────▼────────┐       ┌───────▼────────┐
+                                 │  ElastiCache     │       │  Secrets       │
+                                 │  (Redis)         │       │  Manager       │
+                                 │  Celery Broker   │       │  (API Keys,    │
+                                 │  + Result Store  │       │   DB Creds,    │
+                                 │  + Rate Limits   │       │   JWT Secret)  │
+                                 └────────┬─────────┘       └────────────────┘
+                                          │
+                         ┌────────────────┼────────────────┐
+                         │                │                │
+                  ┌──────▼──────┐  ┌──────▼──────┐  ┌─────▼──────┐
+                  │  AI Worker  │  │   Report    │  │  Default   │
+                  │  Tasks      │  │   Worker    │  │  Worker    │
+                  │ ─────────── │  │ ─────────── │  │ ─────────  │
+                  │ GPT-4o      │  │ Excel/Word  │  │ SLA Sweep  │
+                  │ DALL-E 3    │  │ HTML/CSV    │  │ Notify     │
+                  │ TTS-1       │  │ Export      │  │ Webhooks   │
+                  │ ─────────── │  └──────┬──────┘  └─────┬──────┘
+                  │Auto-Scalable│         │               │
+                  │ (min: 1)    │         │               │
+                  └──────┬──────┘         │               │
+                         │                │               │
+                         └────────────────┼───────────────┘
+                                          │
+                         ┌────────────────┼────────────────┐
+                         │                │                │
+                  ┌──────▼──────┐  ┌──────▼──────┐  ┌─────▼──────┐
+                  │    RDS      │  │  S3 Bucket  │  │  Celery    │
+                  │ PostgreSQL  │  │  (Files)    │  │  Beat      │
+                  │  17         │  │ ─────────── │  │ ─────────  │
+                  │ ─────────── │  │ PDFs        │  │ Hourly SLA │
+                  │ Multi-AZ    │  │ Images      │  │ Sweep      │
+                  │ Auto Backup │  │ Audio       │  │ (Singleton)│
+                  │ 150 max     │  │ Reports     │  │            │
+                  │ connections │  │             │  │            │
+                  └─────────────┘  └─────────────┘  └────────────┘
+
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │                         MONITORING (CloudWatch)                          │
+    │  API 5xx rate │ Queue depth │ RDS connections │ Redis memory │ Task health│
+    └──────────────────────────────────────────────────────────────────────────┘
 ```
 
+**Key design decisions:**
+- CloudFront serves **only** the frontend SPA from S3 — API traffic goes directly through ALB
+- ElastiCache Redis sits between the API layer and workers as the central message broker
+- API tasks and AI Worker tasks are independently auto-scalable (scaling metrics to be configured based on production load patterns)
+- All compute runs in private subnets; only ALB and CloudFront are internet-facing
+- Secrets Manager injects credentials at container startup — no secrets in environment variables or code
+
 ---
+
+## Cost Breakdown
+
+### Base Cost (Minimum Running Configuration)
+
+| Service | Spec | Monthly Cost |
+|---------|------|-------------|
+| ECS Fargate — API (min 2 tasks) | 1 vCPU, 2 GB each | ~$60 |
+| ECS Fargate — AI Worker (min 1 task) | 1 vCPU, 3 GB | ~$40 |
+| ECS Fargate — Report Worker (1 task) | 0.5 vCPU, 2 GB | ~$22 |
+| ECS Fargate — Default Worker (1 task) | 0.25 vCPU, 0.5 GB | ~$8 |
+| ECS Fargate — Beat (1 task) | 0.25 vCPU, 0.5 GB | ~$8 |
+| ElastiCache Redis | cache.t3.micro, Multi-AZ | ~$25 |
+| RDS PostgreSQL | db.t3.medium, Multi-AZ, 20 GB | ~$60 |
+| ALB | 1 load balancer | ~$20 |
+| S3 | 100 GB storage | ~$3 |
+| CloudFront | 100 GB transfer | ~$10 |
+| NAT Gateway | 1 AZ | ~$32 |
+| Secrets Manager | 5 secrets | ~$3 |
+| CloudWatch | Logs + alarms | ~$10 |
+| Route 53 + ACM | 1 hosted zone + SSL | ~$2 |
+| Data transfer | ~100 GB/month | ~$9 |
+| **Base Total** | | **~$312/month** |
+
+### Scaling Cost (Additional Tasks When Active)
+
+| Scaled Service | Per Additional Task | Trigger |
+|---------------|-------------------|---------|
+| API Task | +~$30/month per task | High request volume |
+| AI Worker Task | +~$40/month per task | Queue depth > threshold |
+
+Auto-scaling adds cost only while demand is high. Tasks scale back to minimum during low-traffic periods, keeping base cost stable.
+
+
+---
+
+## ECS Task Summary
+
+| Task | Min Count | Max Count | vCPU | Memory | What it runs | Scaling |
+|------|-----------|-----------|------|--------|-------------|---------|
+| API | 2 | Configurable | 1 | 2 GB | `uvicorn src.main:app` | Auto-scale on request count / CPU |
+| AI Worker | 1 | Configurable | 1 | 3 GB | `celery worker -Q ai_processing -c 2` | Auto-scale on queue depth |
+| Report Worker | 1 | — | 0.5 | 2 GB | `celery worker -Q reports -c 2` | Fixed |
+| Default Worker | 1 | — | 0.25 | 0.5 GB | `celery worker -Q default -c 4` | Fixed |
+| Beat | 1 | — | 0.25 | 0.5 GB | `celery beat` | Fixed (singleton) |
+| **Base Total** | **6 tasks** | | **4 vCPU** | **10 GB** | | |
+
+**Scaling logic:**
+- **API tasks** — auto-scale when sustained request load exceeds capacity of current tasks. Minimum 2 ensures high availability across AZs even at idle.
+- **AI Worker tasks** — auto-scale when `ai_processing` queue depth exceeds a threshold (e.g., >5 pending tasks). Each additional worker doubles concurrent lesson processing. Scales back when queue drains.
+- **Report, Default, Beat** — fixed at 1 task each. Report and default workloads are lightweight and infrequent. Beat must remain a singleton to prevent duplicate scheduled tasks.
+
+Specific scaling metrics and thresholds will be configured after observing production load patterns.
+
+---
+
+## Implementation Roadmap
+
+| Phase | Scope | Deliverables | Dependency |
+|-------|-------|-------------|-----------|
+| **1. Containerization** | Docker setup for local development | Backend Dockerfile, docker-compose.yml (API + 3 workers + Beat + Redis + Postgres), .dockerignore | None |
+| **2. Infrastructure as Code** | Terraform modules for all AWS resources | VPC, ECS cluster, ALB, ElastiCache, RDS (import existing), S3 + CloudFront, ECR, Secrets Manager, CloudWatch, IAM roles | Phase 1 |
+| **3. CI/CD Pipeline** | Automated build and deployment | Backend deploy script (build → ECR → ECS update), frontend deploy script (build → S3 → CloudFront invalidation), migration runner | Phase 2 |
+| **4. Production Launch** | Go-live on AWS | DNS cutover, SSL certificates, secret rotation, smoke testing, monitoring validation | Phase 3 |
+
+---
+
