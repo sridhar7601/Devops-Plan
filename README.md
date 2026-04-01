@@ -75,8 +75,6 @@ Per page, this task does:
 **Time per page:** 18–30 seconds
 **Time per 100-page lesson:** 30–50 minutes (pages run via `asyncio.gather`)
 
-Each task runs 2 concurrent Celery workers (`-c 2`). Each worker holds a DB session for the full lesson duration (15–50 min). The bottleneck is OpenAI API latency, not CPU — but scaling out more tasks increases parallel lesson throughput when multiple uploads are queued.
-
 **Scaling:** Minimum 1 task, scales out based on queue depth (configurable). Each additional task doubles concurrent lesson processing capacity.
 
 **Spec:** 1 vCPU, 3 GB memory per task (images + audio buffered in memory) | Min: 1, Max: configurable
@@ -211,9 +209,6 @@ RDS db.t3.medium supports 150 connections by default. You're safe.
 - SSL termination (HTTPS → HTTP to containers)
 - Health checks on `/api/v1/health` endpoint
 - Distributes load across 2 AZs
-
-**Why ALB, not NLB:**
-Your API uses HTTP/HTTPS with path-based routing. ALB is purpose-built for this. NLB is for TCP/UDP traffic.
 
 ---
 
