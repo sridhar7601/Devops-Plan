@@ -406,14 +406,3 @@ Specific scaling metrics and thresholds will be configured after observing produ
 
 ---
 
-## Implementation Roadmap
-
-| Phase | Scope | Deliverables | Dependency |
-|-------|-------|-------------|-----------|
-| **1. Containerization** | Docker setup for local development | Backend Dockerfile, docker-compose.yml (API + 3 workers + Beat + Redis + Postgres), .dockerignore | None |
-| **2. Infrastructure as Code** | Terraform modules for all AWS resources | VPC, ECS cluster, ALB, ElastiCache, RDS (import existing), S3 + CloudFront, ECR, Secrets Manager, CloudWatch, IAM roles | Phase 1 |
-| **3. CI/CD Pipeline** | Automated build and deployment | Backend deploy script (build → ECR → ECS update), frontend deploy script (build → S3 → CloudFront invalidation), migration runner | Phase 2 |
-| **4. Production Launch** | Go-live on AWS | DNS cutover, SSL certificates, secret rotation, smoke testing, monitoring validation | Phase 3 |
-
----
-
