@@ -65,15 +65,24 @@ celery -A src.celery_app worker -Q ai_processing -c 2 --prefetch-multiplier=1
 
 **What it processes:** `process_lesson` task from `lesson_tasks.py`
 
-Per page, this task does:
-1. `llm_service.generate_lms_content()` — GPT call (5–8s)
-2. DALL-E 3 image generation (8–15s)
-3. TTS audio generation (3–5s)
-4. S3 uploads for image + audio (1–2s)
-5. DB inserts: Page + 14 ContentOutputs + Questions + Options
+Per page, this task processes content in **two stages** for faster user-facing output:
 
-**Time per page:** 18–30 seconds
-**Time per 100-page lesson:** 30–50 minutes (pages run via `asyncio.gather`)
+**Stage 1 — Text Content (fast, user sees results quickly):**
+1. `llm_service.generate_lms_content()` — GPT call for text content (5–8s per page)
+2. DB inserts: Page + 14 ContentOutputs + Questions + Options
+3. Lesson status updated — frontend can display text content immediately
+
+**Stage 2 — Media Enrichment (async, runs after text is available):**
+4. DALL-E 3 image generation (8–15s per page)
+5. TTS audio generation (3–5s per page)
+6. S3 uploads for image + audio (1–2s)
+7. ContentOutput records updated with image_url and audio_url
+
+This two-stage pipeline means users see generated text content within **5–8 seconds per page** instead of waiting 18–30 seconds for everything. Images and audio appear progressively as they complete in the background.
+
+**Time to first content (Stage 1):** 5–8 seconds per page
+**Time to full content (Stage 1 + 2):** 18–30 seconds per page
+**Time per 100-page lesson (full):** 30–50 minutes (pages run via `asyncio.gather`)
 
 **Scaling:** Minimum 1 task, scales out based on queue depth (configurable). Each additional task doubles concurrent lesson processing capacity.
 
@@ -133,7 +142,7 @@ celery -A src.celery_app beat
 
 ---
 
-### 4. ElastiCache Redis — Celery Broker + Result Backend
+### 4. ElastiCache Redis — Celery Broker + Result Backend + Application Cache
 
 **What it does:**
 - **Message broker:** Celery tasks are published here and consumed by workers
@@ -152,7 +161,21 @@ Your `celery_app.py` already uses Redis (`REDIS_URL` env var). Redis gives you:
 - No patching, no backup management
 - Cluster mode available if you outgrow single node
 
-**Spec:** cache.t3.micro (1 node, Multi-AZ), 0.5 GB
+**Caching layer (same Redis instance):**
+
+In addition to Celery brokering, the same ElastiCache Redis instance serves as a cache for frequently accessed data, reducing database load and improving API response times:
+
+| Cached data | TTL | Why cache it |
+|------------|-----|-------------|
+| Dashboard stats (lesson counts, question counts) | 60 seconds | Aggregate COUNT queries hit every time the dashboard loads. Caching avoids repeated full-table scans |
+| Lesson list queries (per tenant, per status) | 30 seconds | Most common API call — paginated list reloaded on every page navigation |
+| Tenant settings | 5 minutes | Loaded on every upload for validation (file size limits, SLA config). Rarely changes |
+| Prompt pack lookups | 5 minutes | Resolved on every lesson processing task. Rarely changes |
+| User role/permission data | 2 minutes | Checked on every authenticated request via JWT middleware |
+
+Cache invalidation is event-driven: when a lesson status changes, the relevant dashboard and lesson list cache keys are cleared. Tenant settings and prompt pack caches are cleared on admin updates.
+
+**Spec:** cache.t3.micro (1 node, Multi-AZ), 0.5 GB — shared between Celery broker and application cache
 
 ---
 
@@ -177,6 +200,8 @@ Your Celery workers hold long-running DB sessions (30–50 min for a lesson). If
 | **Total worst case** | ~68 connections |
 
 RDS db.t3.medium supports 150 connections by default. You're safe.
+
+**Optimization:** AI Worker processes will use short-lived database sessions — open a session for the DB write, commit, close — instead of holding a session for the entire lesson processing duration. This reduces connection pool pressure and prevents stale connections during long OpenAI API waits.
 
 **Spec:** db.t3.medium, Multi-AZ, 20 GB gp3, 7-day backup retention
 
@@ -226,17 +251,37 @@ Without CloudFront, every page load hits S3 directly from the user's browser. Cl
 
 ### 9. CloudWatch — Monitoring
 
-**What to monitor:**
+**Infrastructure metrics:**
 
 | Metric | Source | Alert threshold |
 |--------|--------|----------------|
-| Celery queue depth (ai_processing) | Custom metric from Redis LLEN | > 10 tasks waiting |
 | API 5xx error rate | ALB metrics | > 1% of requests |
 | RDS connections | RDS metrics | > 100 connections |
 | RDS CPU | RDS metrics | > 80% sustained |
 | ECS task health | ECS metrics | Any task unhealthy |
-| Worker task failure rate | Custom metric from Celery | > 10% failure rate |
 | Redis memory usage | ElastiCache metrics | > 80% |
+
+**Task queue and job performance metrics:**
+
+| Metric | Source | Alert threshold | Why it matters |
+|--------|--------|----------------|---------------|
+| Queue depth (ai_processing) | Custom metric from Redis LLEN | > 10 tasks waiting | Triggers AI Worker auto-scaling |
+| Queue depth (reports) | Custom metric from Redis LLEN | > 20 tasks waiting | Indicates report generation backlog |
+| Queue wait time | Custom metric: time between `apply_async()` and worker pickup | > 5 minutes (ai_processing) | Measures how long lessons sit idle before processing starts. High wait time = need more workers |
+| Job duration (Stage 1 — text) | Custom metric from Celery task | > 15 min for 50-page lesson | Detects OpenAI API slowdowns or degradation |
+| Job duration (Stage 2 — media) | Custom metric from Celery task | > 30 min for 50-page lesson | Detects DALL-E/TTS bottlenecks |
+| Task failure rate | Custom metric from Celery | > 10% failure rate | Indicates OpenAI API issues (rate limits, policy violations) |
+| Task retry count | Custom metric from Celery | > 5 retries/hour | Persistent transient errors needing investigation |
+
+**Application performance metrics:**
+
+| Metric | Source | Alert threshold | Why it matters |
+|--------|--------|----------------|---------------|
+| API response time (p95) | ALB target response time | > 500ms (excluding upload endpoints) | Ensures user-facing operations remain fast |
+| Cache hit ratio | Custom metric from Redis | < 70% | Low hit ratio means cache TTLs may be too short or cache keys too specific |
+| DB session hold time | Custom metric from SQLAlchemy | > 30 min per session | Long-held sessions in workers risk connection pool exhaustion |
+
+All custom metrics are published via Celery task hooks (`task_prerun`, `task_postrun`, `task_failure` signals) and a lightweight metrics middleware on the API.
 
 ---
 
@@ -263,6 +308,8 @@ ECS task definitions are visible in the console and API. Anyone with ECS access 
 
 ## Architecture Diagram
 
+![LMS AI Platform — Production AWS Architecture](lms-aws-architecture.png)
+
 ```
     ┌──────────────────────────────────────────────────────────────────────────┐
     │                            USERS / BROWSERS                             │
@@ -270,10 +317,10 @@ ECS task definitions are visible in the console and API. Anyone with ECS access 
                              │                         │
                      Frontend Requests           API Requests
                              │                         │
-                    ┌────────▼────────┐                |
-                    │   CloudFront    │                | 
-                    │   (CDN)         │                |
-                    └────────┬────────┘                |
+                    ┌────────▼────────┐                │
+                    │   CloudFront    │                │
+                    │   (CDN)         │                │
+                    └────────┬────────┘                │
                              │                         │
                     ┌────────▼────────┐       ┌────────▼────────┐
                     │   S3 Bucket     │       │      ALB        │
@@ -299,7 +346,7 @@ ECS task definitions are visible in the console and API. Anyone with ECS access 
                                  │  (Redis)         │       │  Manager       │
                                  │  Celery Broker   │       │  (API Keys,    │
                                  │  + Result Store  │       │   DB Creds,    │
-                                 │  + Rate Limits   │       │   JWT Secret)  │
+                                 │  + App Cache     │       │   JWT Secret)  │
                                  └────────┬─────────┘       └────────────────┘
                                           │
                          ┌────────────────┼────────────────┐
@@ -308,10 +355,12 @@ ECS task definitions are visible in the console and API. Anyone with ECS access 
                   │  AI Worker  │  │   Report    │  │  Default   │
                   │  Tasks      │  │   Worker    │  │  Worker    │
                   │ ─────────── │  │ ─────────── │  │ ─────────  │
-                  │ GPT-4o      │  │ Excel/Word  │  │ SLA Sweep  │
-                  │ DALL-E 3    │  │ HTML/CSV    │  │ Notify     │
-                  │ TTS-1       │  │ Export      │  │ Webhooks   │
-                  │ ─────────── │  └──────┬──────┘  └─────┬──────┘
+                  │ Stage 1:    │  │ Excel/Word  │  │ SLA Sweep  │
+                  │  GPT-4o     │  │ HTML/CSV    │  │ Notify     │
+                  │ Stage 2:    │  │ Export      │  │ Webhooks   │
+                  │  DALL-E 3   │  └──────┬──────┘  └─────┬──────┘
+                  │  TTS-1      │         │               │
+                  │ ─────────── │         │               │
                   │Auto-Scalable│         │               │
                   │ (min: 1)    │         │               │
                   └──────┬──────┘         │               │
@@ -333,16 +382,35 @@ ECS task definitions are visible in the console and API. Anyone with ECS access 
 
     ┌──────────────────────────────────────────────────────────────────────────┐
     │                         MONITORING (CloudWatch)                          │
-    │  API 5xx rate │ Queue depth │ RDS connections │ Redis memory │ Task health│
+    │  API latency │ Queue depth │ Queue wait time │ Job duration │ Cache hits │
     └──────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Key design decisions:**
 - CloudFront serves **only** the frontend SPA from S3 — API traffic goes directly through ALB
-- ElastiCache Redis sits between the API layer and workers as the central message broker
+- ElastiCache Redis sits between the API layer and workers as the central message broker and application cache
 - API tasks and AI Worker tasks are independently auto-scalable (scaling metrics to be configured based on production load patterns)
 - All compute runs in private subnets; only ALB and CloudFront are internet-facing
 - Secrets Manager injects credentials at container startup — no secrets in environment variables or code
+
+---
+
+## Auto-Scaling Configuration
+
+### Scaling Rules (Defined Upfront)
+
+| Service | Metric | Scale-out threshold | Scale-in threshold | Min | Max |
+|---------|--------|--------------------|--------------------|-----|-----|
+| API Tasks | ALB RequestCountPerTarget | > 1000 requests/min sustained for 3 min | < 200 requests/min sustained for 10 min | 2 | Configurable |
+| API Tasks | ECS CPU Utilization | > 70% sustained for 3 min | < 30% sustained for 10 min | 2 | Configurable |
+| AI Worker Tasks | Queue depth (ai_processing) | > 5 pending tasks for 2 min | 0 pending tasks for 10 min | 1 | Configurable |
+
+**Scaling behavior:**
+- **API tasks** — scale out on either high request count OR high CPU (whichever triggers first). Scale in conservatively (10-min cooldown) to avoid flapping. Minimum 2 ensures high availability across AZs even at idle.
+- **AI Worker tasks** — scale out when `ai_processing` queue depth exceeds 5 pending tasks. Each additional worker adds 2 concurrent lesson processing slots. Scale in when queue is empty for 10 minutes to avoid premature termination of in-progress tasks.
+- **Report, Default, Beat** — fixed at 1 task each. Report and default workloads are lightweight and infrequent. Beat must remain a singleton to prevent duplicate scheduled tasks.
+
+Thresholds can be tuned after observing production load patterns.
 
 ---
 
@@ -378,7 +446,6 @@ ECS task definitions are visible in the console and API. Anyone with ECS access 
 
 Auto-scaling adds cost only while demand is high. Tasks scale back to minimum during low-traffic periods, keeping base cost stable.
 
-
 ---
 
 ## ECS Task Summary
@@ -391,13 +458,3 @@ Auto-scaling adds cost only while demand is high. Tasks scale back to minimum du
 | Default Worker | 1 | — | 0.25 | 0.5 GB | `celery worker -Q default -c 4` | Fixed |
 | Beat | 1 | — | 0.25 | 0.5 GB | `celery beat` | Fixed (singleton) |
 | **Base Total** | **6 tasks** | | **4 vCPU** | **10 GB** | | |
-
-**Scaling logic:**
-- **API tasks** — auto-scale when sustained request load exceeds capacity of current tasks. Minimum 2 ensures high availability across AZs even at idle.
-- **AI Worker tasks** — auto-scale when `ai_processing` queue depth exceeds a threshold (e.g., >5 pending tasks). Each additional worker doubles concurrent lesson processing. Scales back when queue drains.
-- **Report, Default, Beat** — fixed at 1 task each. Report and default workloads are lightweight and infrequent. Beat must remain a singleton to prevent duplicate scheduled tasks.
-
-Specific scaling metrics and thresholds will be configured after observing production load patterns.
-
----
-
